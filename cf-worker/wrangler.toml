@@ -1,0 +1,5 @@
+name = "pharmasnap-scan-medicine"
+main = "src/index.js"
+compatibility_date = "2026-07-01"
+
+# ANTHROPIC_API_KEY is set as a secret, not here — see cf-worker/README.md
