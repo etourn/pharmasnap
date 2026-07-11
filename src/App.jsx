@@ -21,6 +21,7 @@ function App() {
   const [loading, setLoading] = useState(true)
   const [scanning, setScanning] = useState(false)
   const [scanNotice, setScanNotice] = useState(null) // { name: "low"|"high", expiry: "low"|"high", notes }
+  const [scanMethod, setScanMethod] = useState("barcode") // "barcode" | "photo"
 
   useEffect(() => {
     const unsub = onSnapshot(collection(db, "medicines"), (snapshot) => {
@@ -149,6 +150,33 @@ function App() {
             </div>
           )}
 
+          <div className="flex bg-gray-100 rounded-full p-1">
+          <button
+            onClick={() => setScanMethod("barcode")}
+            className={`flex-1 text-sm py-1.5 rounded-full transition ${
+              scanMethod === "barcode" ? "bg-white shadow-sm font-medium text-green-700" : "text-gray-500"
+            }`}
+          >
+            Barcode
+          </button>
+          <button
+            onClick={() => setScanMethod("photo")}
+            className={`flex-1 text-sm py-1.5 rounded-full transition ${
+              scanMethod === "photo" ? "bg-white shadow-sm font-medium text-green-700" : "text-gray-500"
+            }`}
+          >
+            Photo
+          </button>
+        </div>
+
+        {scanMethod === "barcode" ? (
+          <button
+            onClick={() => setScannerMode("add")}
+            className="w-full bg-white border-2 border-dashed border-green-300 rounded-xl p-4 flex items-center justify-center gap-2 active:bg-green-50"
+          >
+            <span className="text-green-700 font-medium text-sm">📷 Scan barcode</span>
+          </button>
+        ) : (
           <label className="w-full bg-white border-2 border-dashed border-green-300 rounded-xl p-4 flex items-center justify-center gap-2 active:bg-green-50 cursor-pointer">
             <input
               type="file"
@@ -159,9 +187,14 @@ function App() {
               disabled={scanning}
             />
             <span className="text-green-700 font-medium text-sm">
-              {scanning ? "Reading the box…" : "📷 Scan medicine box"}
+              {scanning ? "Reading the box…" : "🖼️ Scan medicine box"}
             </span>
           </label>
+        )}
+
+        {form.barcode && (
+          <p className="text-xs text-gray-400 -mt-2">Barcode: {form.barcode}</p>
+        )}
 
           {scanNotice && (
             <div className="bg-green-50 border border-green-200 rounded-lg p-3">
