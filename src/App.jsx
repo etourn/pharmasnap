@@ -9,6 +9,7 @@ import {
   serverTimestamp
 } from "firebase/firestore"
 import { getDemandForecast, getExpiryRisk } from "./forecast"
+import BarcodeScanner from "./BarcodeScanner"
 
 const SCAN_WORKER_URL = import.meta.env.VITE_SCAN_WORKER_URL
 
@@ -22,6 +23,8 @@ function App() {
   const [scanning, setScanning] = useState(false)
   const [scanNotice, setScanNotice] = useState(null) // { name: "low"|"high", expiry: "low"|"high", notes }
   const [scanMethod, setScanMethod] = useState("barcode") // "barcode" | "photo"
+  const [scannerOpen, setScannerOpen] = useState(false)
+  const [matchedId, setMatchedId] = useState(null)
 
   useEffect(() => {
     const unsub = onSnapshot(collection(db, "medicines"), (snapshot) => {
@@ -60,16 +63,48 @@ function App() {
   const addMedicine = async () => {
     if (!form.name.trim()) { setError("Please enter a medicine name"); return }
     if (!form.qty || isNaN(form.qty) || Number(form.qty) < 0) { setError("Please enter a valid quantity"); return }
-    await addDoc(collection(db, "medicines"), {
-      name: form.name.trim(),
-      qty: Number(form.qty),
-      threshold: Number(form.threshold) || 10,
-      expiry: form.expiry || null,
-      createdAt: serverTimestamp()
-    })
+    if (matchedId) {
+      await updateDoc(doc(db, "medicines", matchedId), {
+        name: form.name.trim(),
+        qty: Number(form.qty),
+        threshold: Number(form.threshold) || 10,
+        expiry: form.expiry || null
+      })
+    } else {
+      await addDoc(collection(db, "medicines"), {
+        name: form.name.trim(),
+        qty: Number(form.qty),
+        threshold: Number(form.threshold) || 10,
+        expiry: form.expiry || null,
+        barcode: form.barcode || null,
+        createdAt: serverTimestamp()
+      })
+    }
     setForm({ name: "", qty: "", threshold: "", expiry: "" })
+    setMatchedId(null)
+    setScanNotice(null)
     setError("")
     setScreen("inventory")
+  }
+
+  const handleBarcodeDetected = (code) => {
+    setScannerOpen(false)
+    const match = medicines.find(m => m.barcode === code)
+    if (match) {
+      setForm({
+        name: match.name,
+        qty: String(match.qty),
+        threshold: String(match.threshold),
+        expiry: match.expiry || "",
+        barcode: code
+      })
+      setMatchedId(match.id)
+      setScanNotice({ name: "high", expiry: "high", notes: "Matched an existing medicine — review and confirm to update it" })
+    } else {
+      setForm({ name: "", qty: "", threshold: "", expiry: "", barcode: code })
+      setMatchedId(null)
+      setScanNotice(null)
+    }
   }
 
   const fileToBase64 = (file) =>
@@ -136,7 +171,7 @@ function App() {
     return (
       <div className="min-h-screen bg-[#F5F5F0] max-w-sm mx-auto">
         <div className="bg-green-700 px-4 pt-10 pb-4 flex items-center gap-3">
-          <button onClick={() => { setScreen("inventory"); setError("") }} className="text-white text-xl">←</button>
+          <button onClick={() => { setScreen("inventory"); setError(""); setMatchedId(null); setScanNotice(null); setForm(f => ({ ...f, barcode: undefined })) }} className="text-white text-xl">←</button>
           <div>
             <h1 className="text-white text-xl font-semibold">Add Medicine</h1>
             <p className="text-green-200 text-sm">Fill in the details below</p>
@@ -171,7 +206,7 @@ function App() {
 
         {scanMethod === "barcode" ? (
           <button
-            onClick={() => setScannerMode("add")}
+            onClick={() => setScannerOpen(true)}
             className="w-full bg-white border-2 border-dashed border-green-300 rounded-xl p-4 flex items-center justify-center gap-2 active:bg-green-50"
           >
             <span className="text-green-700 font-medium text-sm">📷 Scan barcode</span>
@@ -223,7 +258,9 @@ function App() {
           </div>
 
           <div className="bg-white rounded-xl p-4 shadow-sm border border-gray-100">
-            <label className="text-xs text-gray-500 font-medium uppercase tracking-wide">Starting quantity</label>
+            <label className="text-xs text-gray-500 font-medium uppercase tracking-wide">
+              {matchedId ? "Current quantity" : "Starting quantity"}
+            </label>
             <input
               type="number"
               placeholder="e.g. 100"
@@ -260,9 +297,13 @@ function App() {
             onClick={addMedicine}
             className="w-full bg-green-700 text-white font-semibold py-4 rounded-xl active:bg-green-800"
           >
-            Confirm and add medicine
+            {matchedId ? "Update medicine" : "Confirm and add medicine"}
           </button>
         </div>
+
+        {scannerOpen && (
+          <BarcodeScanner onDetected={handleBarcodeDetected} onClose={() => setScannerOpen(false)} />
+        )}
       </div>
     )
   }
