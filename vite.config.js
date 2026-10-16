@@ -9,4 +9,8 @@ export default defineConfig({
     tailwindcss(),
     basicSsl(),
   ],
+  // pre-bundle at startup so Vite doesn't discover it mid-load and force a reload
+  optimizeDeps: {
+    include: ["firebase/auth"],
+  },
 })

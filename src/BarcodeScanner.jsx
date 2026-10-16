@@ -48,7 +48,15 @@ export default function BarcodeScanner({ onDetected, onClose }) {
         controls = c
         if (!active) controls.stop() // unmounted while the camera was still starting up
       })
-      .catch((e) => setError(e?.message || "Couldn't access the camera"))
+      .catch((e) => {
+        if (e?.name === "NotAllowedError") {
+          setError("Camera permission was denied — allow camera access for this site in your browser settings, then reload")
+        } else if (e?.name === "NotFoundError") {
+          setError("No camera found on this device")
+        } else {
+          setError(e?.message || "Couldn't access the camera")
+        }
+      })
 
     return () => { active = false; controls?.stop() }
   }, [])

@@ -1,30 +1,79 @@
-import { useState, useEffect } from "react"
+import { useState, useEffect, useCallback } from "react"
 import { db } from "./firebase"
 import {
   collection,
   onSnapshot,
   addDoc,
   updateDoc,
+  deleteDoc,
   doc,
+  increment,
   serverTimestamp
 } from "firebase/firestore"
 import { getDemandForecast, getExpiryRisk } from "./forecast"
+import { CATEGORIES } from "./categories"
+import { formatMoney, parsePrice, isValidPrice, saleLine, stockValue } from "./pricing"
+import { unitsPerBoxOf, formatStock, sellLabel } from "./units"
 import BarcodeScanner from "./BarcodeScanner"
+import MedicineDetail from "./MedicineDetail"
+import MedicineForm from "./MedicineForm"
+import Analytics from "./Analytics"
 
 const SCAN_WORKER_URL = import.meta.env.VITE_SCAN_WORKER_URL
+
+const EMPTY_FORM = {
+  name: "", qty: "", looseQty: "", threshold: "", expiry: "",
+  category: "", buyPrice: "", sellPrice: "", unitSellPrice: "",
+  barcode: "", noBarcode: false,
+  sellLoose: false, unitsPerBox: "", unitName: "strip"
+}
+
+const priceText = (v) => (v == null ? "" : String(v))
+
+// qty is "" when receiving a delivery (the form asks how many arrived), otherwise the current stock
+const formFromMedicine = (med, { receiving = false } = {}) => {
+  const perBox = unitsPerBoxOf(med)
+  return {
+    name: med.name,
+    qty: receiving ? "" : String(Math.floor(med.qty / perBox)),
+    looseQty: receiving || perBox === 1 || med.qty % perBox === 0 ? "" : String(med.qty % perBox),
+    threshold: String(med.threshold ?? ""),
+    expiry: med.expiry || "",
+    category: med.category || "",
+    buyPrice: priceText(med.buyPrice),
+    sellPrice: priceText(med.sellPrice),
+    unitSellPrice: priceText(med.unitSellPrice),
+    barcode: med.barcode || "",
+    noBarcode: !!med.noBarcode,
+    sellLoose: perBox > 1,
+    unitsPerBox: perBox > 1 ? String(perBox) : "",
+    unitName: med.unitName || "strip"
+  }
+}
+
+const UNCATEGORIZED = "Uncategorized"
+const NO_BARCODE_FILTER = "__no_barcode"
+const lacksBarcode = (m) => !m.barcode && !m.noBarcode
 
 function App() {
   const [medicines, setMedicines] = useState([])
   const [sales, setSales] = useState([])
-  const [screen, setScreen] = useState("inventory")
-  const [form, setForm] = useState({ name: "", qty: "", threshold: "", expiry: "" })
+  const [screen, setScreen] = useState("inventory") // "inventory" | "add" | "detail" | "analytics"
+  const [selectedId, setSelectedId] = useState(null)
+  const [form, setForm] = useState(EMPTY_FORM)
   const [error, setError] = useState("")
+  const [fieldErrors, setFieldErrors] = useState({})
+  const [saving, setSaving] = useState(false)
   const [loading, setLoading] = useState(true)
   const [scanning, setScanning] = useState(false)
   const [scanNotice, setScanNotice] = useState(null) // { name: "low"|"high", expiry: "low"|"high", notes }
-  const [scanMethod, setScanMethod] = useState("barcode") // "barcode" | "photo"
   const [scannerOpen, setScannerOpen] = useState(false)
-  const [matchedId, setMatchedId] = useState(null)
+  const [scanPurpose, setScanPurpose] = useState("form") // "form" | "attach" | "search"
+  const [matchedId, setMatchedId] = useState(null) // receiving stock for an existing medicine
+  const [editingId, setEditingId] = useState(null) // correcting an existing medicine's details
+  const [query, setQuery] = useState("")
+  const [categoryFilter, setCategoryFilter] = useState("")
+  const [searchNotice, setSearchNotice] = useState(null) // { code } when a scanned barcode matched nothing
 
   useEffect(() => {
     const unsub = onSnapshot(collection(db, "medicines"), (snapshot) => {
@@ -37,10 +86,39 @@ function App() {
 
   useEffect(() => {
     const unsub = onSnapshot(collection(db, "sales"), (snapshot) => {
-      setSales(snapshot.docs.map(doc => doc.data()))
+      setSales(snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() })))
     })
     return () => unsub()
   }, [])
+
+  const resetForm = useCallback(() => {
+    setForm(EMPTY_FORM)
+    setMatchedId(null)
+    setEditingId(null)
+    setScanNotice(null)
+    setError("")
+    setFieldErrors({})
+  }, [])
+
+  // Screens are history entries, so the phone's back gesture steps back a screen
+  // instead of leaving the app. Every in-app "back" is history.back() too.
+  useEffect(() => {
+    window.history.replaceState(null, "")
+    const onPop = (e) => {
+      setScreen(e.state?.screen ?? "inventory")
+      setSelectedId(e.state?.id ?? null)
+      resetForm()
+    }
+    window.addEventListener("popstate", onPop)
+    return () => window.removeEventListener("popstate", onPop)
+  }, [resetForm])
+
+  const navigate = (next, id = null) => {
+    window.history.pushState({ screen: next, id }, "")
+    setScreen(next)
+    setSelectedId(id)
+  }
+  const goBack = () => window.history.back()
 
   const demandForecast = getDemandForecast(medicines, sales)
   const expiryRisk = getExpiryRisk(medicines, sales)
@@ -50,60 +128,191 @@ function App() {
   const sellOne = async (id) => {
     const med = medicines.find(m => m.id === id)
     if (!med || med.qty <= 0) return
-    const medRef = doc(db, "medicines", id)
-    await updateDoc(medRef, { qty: med.qty - 1 })
+    const line = saleLine(med, 1, "unit")
+    await updateDoc(doc(db, "medicines", id), { qty: increment(-line.qty) })
     await addDoc(collection(db, "sales"), {
       medicineId: id,
       medicineName: med.name,
-      qty: 1,
+      qty: line.qty,
+      unitPrice: line.unitPrice,
+      unitCost: line.unitCost,
+      unitsPerBox: unitsPerBoxOf(med),
+      source: "sale",
       soldAt: serverTimestamp()
     })
   }
 
-  const addMedicine = async () => {
-    if (!form.name.trim()) { setError("Please enter a medicine name"); return }
-    if (!form.qty || isNaN(form.qty) || Number(form.qty) < 0) { setError("Please enter a valid quantity"); return }
-    if (matchedId) {
-      await updateDoc(doc(db, "medicines", matchedId), {
-        name: form.name.trim(),
-        qty: Number(form.qty),
-        threshold: Number(form.threshold) || 10,
-        expiry: form.expiry || null
-      })
-    } else {
-      await addDoc(collection(db, "medicines"), {
-        name: form.name.trim(),
-        qty: Number(form.qty),
-        threshold: Number(form.threshold) || 10,
-        expiry: form.expiry || null,
-        barcode: form.barcode || null,
-        createdAt: serverTimestamp()
-      })
+  const deleteMedicine = async (id) => {
+    await deleteDoc(doc(db, "medicines", id))
+    goBack()
+  }
+
+  const saveMedicine = async () => {
+    const mode = editingId ? "edit" : matchedId ? "receive" : "add"
+    const existing = medicines.find(m => m.id === (editingId || matchedId))
+    const barcode = form.barcode.trim()
+    const perBox = mode === "receive" ? unitsPerBoxOf(existing) : form.sellLoose ? Number(form.unitsPerBox) : 1
+    const unit = form.unitName || "unit"
+    const boxes = form.qty === "" ? null : Number(form.qty)
+    const loose = form.looseQty === "" ? 0 : Number(form.looseQty)
+    const buyPrice = parsePrice(form.buyPrice)
+    const sellPrice = parsePrice(form.sellPrice)
+    const unitSellPrice = parsePrice(form.unitSellPrice)
+
+    const errs = {}
+    if (mode !== "receive") {
+      if (!barcode && !form.noBarcode) {
+        errs.barcode = "Scan or type the barcode — or tick “This item has no barcode”"
+      } else if (barcode) {
+        const dupe = medicines.find(m => m.barcode === barcode && m.id !== editingId)
+        if (dupe) errs.barcode = `That barcode is already used by ${dupe.name}`
+      }
     }
-    setForm({ name: "", qty: "", threshold: "", expiry: "" })
+    if (!form.name.trim()) errs.name = "Enter the medicine name"
+    if (mode !== "receive" && form.sellLoose && !(Number.isInteger(perBox) && perBox >= 2)) {
+      errs.unitsPerBox = `Enter how many ${unit}s are in one box (2 or more)`
+    }
+    if (boxes === null && form.looseQty === "") {
+      errs.qty = "Enter the quantity"
+    } else if (boxes !== null && (!Number.isInteger(boxes) || boxes < 0)) {
+      errs.qty = "Enter a whole number, 0 or more"
+    }
+    if (!Number.isInteger(loose) || loose < 0 || (perBox >= 2 && loose >= perBox)) {
+      errs.looseQty = `Loose ${unit}s must be a whole number below ${perBox}`
+    }
+    if (!isValidPrice(buyPrice)) errs.buyPrice = "Enter a price like 2.50 (up to 2 decimals)"
+    if (!isValidPrice(sellPrice)) errs.sellPrice = "Enter a price like 2.50 (up to 2 decimals)"
+    if (!isValidPrice(unitSellPrice)) errs.unitSellPrice = "Enter a price like 2.50 (up to 2 decimals)"
+
+    setError("")
+    setFieldErrors(errs)
+    const firstBad = Object.keys(errs)[0]
+    if (firstBad) {
+      requestAnimationFrame(() =>
+        document.getElementById(`field-${firstBad}`)?.scrollIntoView({ behavior: "smooth", block: "center" })
+      )
+      return
+    }
+
+    const base = (boxes ?? 0) * perBox + loose
+    const oldPerBox = unitsPerBoxOf(existing)
+    let threshold = Number(form.threshold) || (oldPerBox > 1 ? oldPerBox : 10)
+    if (mode === "edit" && oldPerBox !== perBox) {
+      // the box size was corrected, so the alert level (typed in the old unit) is rescaled with the stock
+      threshold = Math.round((threshold * perBox) / oldPerBox)
+      const ok = window.confirm(
+        `Box size changes from ${oldPerBox} to ${perBox}.\nStock becomes ${base} and the low-stock alert becomes ${threshold}. Continue?`
+      )
+      if (!ok) return
+    } else if (mode !== "edit" && form.threshold === "" && perBox > 1) {
+      threshold = perBox
+    }
+
+    const common = {
+      name: form.name.trim(),
+      threshold,
+      expiry: form.expiry || null,
+      category: form.category || null,
+      buyPrice,
+      sellPrice
+    }
+    const unitFields = {
+      unitsPerBox: perBox > 1 ? perBox : null,
+      unitName: perBox > 1 ? form.unitName : null,
+      unitSellPrice: perBox > 1 ? unitSellPrice : null
+    }
+    const barcodeFields = { barcode: barcode || null, noBarcode: !barcode && form.noBarcode }
+
+    setSaving(true)
+    try {
+      if (mode === "edit") {
+        await updateDoc(doc(db, "medicines", editingId), { ...common, ...unitFields, ...barcodeFields, qty: base })
+      } else if (mode === "receive") {
+        await updateDoc(doc(db, "medicines", matchedId), { ...common, qty: (existing?.qty ?? 0) + (boxes ?? 0) * perBox })
+      } else {
+        await addDoc(collection(db, "medicines"), {
+          ...common, ...unitFields, ...barcodeFields, qty: base, createdAt: serverTimestamp()
+        })
+      }
+      goBack()
+    } catch {
+      setError("Couldn't save — check your connection and try again")
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  const startAdd = (name = "", barcode = "") => {
+    setForm({ ...EMPTY_FORM, name, barcode })
+    setMatchedId(null)
+    setEditingId(null)
+    setScanNotice(null)
+    setError("")
+    setFieldErrors({})
+    setSearchNotice(null)
+    navigate("add")
+  }
+
+  const startEdit = (med) => {
+    setForm(formFromMedicine(med))
+    setEditingId(med.id)
     setMatchedId(null)
     setScanNotice(null)
     setError("")
-    setScreen("inventory")
+    setFieldErrors({})
+    navigate("add", med.id)
+  }
+
+  // Sets up the form to add a delivery to an existing medicine. The caller navigates
+  // if it isn't already on the Add screen.
+  const startReceive = (med) => {
+    setForm(formFromMedicine(med, { receiving: true }))
+    setMatchedId(med.id)
+    setEditingId(null)
+    setFieldErrors({})
+    setScanNotice({
+      name: "high",
+      expiry: "high",
+      notes: `Matched an existing medicine (${formatStock(med.qty, med)} in stock) — enter how many you received`
+    })
+  }
+
+  const openScanner = (purpose) => {
+    setScanPurpose(purpose)
+    setScannerOpen(true)
   }
 
   const handleBarcodeDetected = (code) => {
     setScannerOpen(false)
     const match = medicines.find(m => m.barcode === code)
-    if (match) {
-      setForm({
-        name: match.name,
-        qty: String(match.qty),
-        threshold: String(match.threshold),
-        expiry: match.expiry || "",
-        barcode: code
-      })
-      setMatchedId(match.id)
-      setScanNotice({ name: "high", expiry: "high", notes: "Matched an existing medicine — review and confirm to update it" })
-    } else {
-      setForm({ name: "", qty: "", threshold: "", expiry: "", barcode: code })
+
+    if (scanPurpose === "search") {
+      if (match) {
+        setSearchNotice(null)
+        setQuery("")
+        setCategoryFilter("")
+        navigate("detail", match.id)
+      } else {
+        setSearchNotice({ code })
+      }
+    } else if (scanPurpose === "attach") {
+      if (match && match.id !== editingId) {
+        setError(`That barcode already belongs to ${match.name}`)
+        return
+      }
+      setError("")
+      setFieldErrors(errs => ({ ...errs, barcode: undefined }))
+      setForm(f => ({ ...f, barcode: code, noBarcode: false }))
+    } else if (match) {
+      startReceive(match)
+    } else if (matchedId) {
+      // was receiving stock for another medicine; this code is a different, unknown one
+      setForm({ ...EMPTY_FORM, barcode: code })
       setMatchedId(null)
       setScanNotice(null)
+    } else {
+      setFieldErrors(errs => ({ ...errs, barcode: undefined }))
+      setForm(f => ({ ...f, barcode: code, noBarcode: false }))
     }
   }
 
@@ -165,163 +374,133 @@ function App() {
   }
 
   const lowStock = medicines.filter(m => m.qty <= m.threshold)
+  const selectedMed = medicines.find(m => m.id === selectedId)
 
-  // ── ADD SCREEN ────────────────────────────────────────────────────────────
+  // ── ADD / EDIT / RECEIVE-STOCK SCREEN ─────────────────────────────────────
   if (screen === "add") {
+    const receiving = medicines.find(m => m.id === matchedId)
     return (
-      <div className="min-h-screen bg-[#F5F5F0] max-w-sm mx-auto">
-        <div className="bg-green-700 px-4 pt-10 pb-4 flex items-center gap-3">
-          <button onClick={() => { setScreen("inventory"); setError(""); setMatchedId(null); setScanNotice(null); setForm(f => ({ ...f, barcode: undefined })) }} className="text-white text-xl">←</button>
-          <div>
-            <h1 className="text-white text-xl font-semibold">Add Medicine</h1>
-            <p className="text-green-200 text-sm">Fill in the details below</p>
-          </div>
-        </div>
-
-        <div className="px-4 mt-6 flex flex-col gap-4">
-          {error && (
-            <div className="bg-red-50 border border-red-200 rounded-lg p-3">
-              <p className="text-red-600 text-sm">{error}</p>
-            </div>
-          )}
-
-          <div className="flex bg-gray-100 rounded-full p-1">
-          <button
-            onClick={() => setScanMethod("barcode")}
-            className={`flex-1 text-sm py-1.5 rounded-full transition ${
-              scanMethod === "barcode" ? "bg-white shadow-sm font-medium text-green-700" : "text-gray-500"
-            }`}
-          >
-            Barcode
-          </button>
-          <button
-            onClick={() => setScanMethod("photo")}
-            className={`flex-1 text-sm py-1.5 rounded-full transition ${
-              scanMethod === "photo" ? "bg-white shadow-sm font-medium text-green-700" : "text-gray-500"
-            }`}
-          >
-            Photo
-          </button>
-        </div>
-
-        {scanMethod === "barcode" ? (
-          <button
-            onClick={() => setScannerOpen(true)}
-            className="w-full bg-white border-2 border-dashed border-green-300 rounded-xl p-4 flex items-center justify-center gap-2 active:bg-green-50"
-          >
-            <span className="text-green-700 font-medium text-sm">📷 Scan barcode</span>
-          </button>
-        ) : (
-          <label className="w-full bg-white border-2 border-dashed border-green-300 rounded-xl p-4 flex items-center justify-center gap-2 active:bg-green-50 cursor-pointer">
-            <input
-              type="file"
-              accept="image/*"
-              capture="environment"
-              onChange={handleScan}
-              className="hidden"
-              disabled={scanning}
-            />
-            <span className="text-green-700 font-medium text-sm">
-              {scanning ? "Reading the box…" : "🖼️ Scan medicine box"}
-            </span>
-          </label>
-        )}
-
-        {form.barcode && (
-          <p className="text-xs text-gray-400 -mt-2">Barcode: {form.barcode}</p>
-        )}
-
-          {scanNotice && (
-            <div className="bg-green-50 border border-green-200 rounded-lg p-3">
-              <p className="text-green-800 text-sm font-medium">Scanned — please check before confirming</p>
-              {scanNotice.name === "low" && (
-                <p className="text-green-700 text-xs mt-1">⚠️ Name wasn't clear — double check it</p>
-              )}
-              {scanNotice.expiry === "low" && (
-                <p className="text-green-700 text-xs mt-1">⚠️ Expiry date wasn't clear — double check or leave blank</p>
-              )}
-              {scanNotice.notes && (
-                <p className="text-green-700 text-xs mt-1">{scanNotice.notes}</p>
-              )}
-            </div>
-          )}
-
-          <div className="bg-white rounded-xl p-4 shadow-sm border border-gray-100">
-            <label className="text-xs text-gray-500 font-medium uppercase tracking-wide">Medicine name</label>
-            <input
-              type="text"
-              placeholder="e.g. Paracetamol 500mg"
-              value={form.name}
-              onChange={e => setForm({ ...form, name: e.target.value })}
-              className="w-full mt-2 text-sm text-gray-800 outline-none border-b border-gray-200 pb-1 focus:border-green-500"
-            />
-          </div>
-
-          <div className="bg-white rounded-xl p-4 shadow-sm border border-gray-100">
-            <label className="text-xs text-gray-500 font-medium uppercase tracking-wide">
-              {matchedId ? "Current quantity" : "Starting quantity"}
-            </label>
-            <input
-              type="number"
-              placeholder="e.g. 100"
-              value={form.qty}
-              onChange={e => setForm({ ...form, qty: e.target.value })}
-              className="w-full mt-2 text-sm text-gray-800 outline-none border-b border-gray-200 pb-1 focus:border-green-500"
-            />
-          </div>
-
-          <div className="bg-white rounded-xl p-4 shadow-sm border border-gray-100">
-            <label className="text-xs text-gray-500 font-medium uppercase tracking-wide">Low stock alert at</label>
-            <input
-              type="number"
-              placeholder="e.g. 10 (default)"
-              value={form.threshold}
-              onChange={e => setForm({ ...form, threshold: e.target.value })}
-              className="w-full mt-2 text-sm text-gray-800 outline-none border-b border-gray-200 pb-1 focus:border-green-500"
-            />
-            <p className="text-xs text-gray-400 mt-2">You will get an alert when stock drops below this number</p>
-          </div>
-
-          <div className="bg-white rounded-xl p-4 shadow-sm border border-gray-100">
-            <label className="text-xs text-gray-500 font-medium uppercase tracking-wide">Expiry date</label>
-            <input
-              type="date"
-              value={form.expiry}
-              onChange={e => setForm({ ...form, expiry: e.target.value })}
-              className="w-full mt-2 text-sm text-gray-800 outline-none border-b border-gray-200 pb-1 focus:border-green-500"
-            />
-            <p className="text-xs text-gray-400 mt-2">AI will warn you before medicines expire unsold</p>
-          </div>
-
-          <button
-            onClick={addMedicine}
-            className="w-full bg-green-700 text-white font-semibold py-4 rounded-xl active:bg-green-800"
-          >
-            {matchedId ? "Update medicine" : "Confirm and add medicine"}
-          </button>
-        </div>
-
+      <>
+        <MedicineForm
+          mode={editingId ? "edit" : matchedId ? "receive" : "add"}
+          form={form}
+          setForm={setForm}
+          error={error}
+          fieldErrors={fieldErrors}
+          scanNotice={scanNotice}
+          scanning={scanning}
+          saving={saving}
+          currentStock={receiving ? formatStock(receiving.qty, receiving) : ""}
+          onBack={goBack}
+          onScanBarcode={() => openScanner(editingId ? "attach" : "form")}
+          onPhoto={handleScan}
+          onSave={saveMedicine}
+        />
         {scannerOpen && (
           <BarcodeScanner onDetected={handleBarcodeDetected} onClose={() => setScannerOpen(false)} />
         )}
-      </div>
+      </>
+    )
+  }
+
+  // ── ANALYTICS SCREEN ──────────────────────────────────────────────────────
+  if (screen === "analytics") {
+    return <Analytics medicines={medicines} sales={sales} onBack={goBack} />
+  }
+
+  // ── DETAIL SCREEN ─────────────────────────────────────────────────────────
+  if (screen === "detail" && selectedMed) {
+    return (
+      <MedicineDetail
+        med={selectedMed}
+        sales={sales}
+        forecast={demandForecast.find(f => f.id === selectedMed.id)}
+        risk={expiryRisk.find(r => r.id === selectedMed.id)}
+        onBack={goBack}
+        onSell={() => sellOne(selectedMed.id)}
+        onAddStock={() => { startReceive(selectedMed); navigate("add", selectedMed.id) }}
+        onEdit={() => startEdit(selectedMed)}
+        onDelete={() => deleteMedicine(selectedMed.id)}
+      />
     )
   }
 
   // ── INVENTORY SCREEN ──────────────────────────────────────────────────────
+  const q = query.trim().toLowerCase()
+  const missingBarcodeCount = medicines.filter(lacksBarcode).length
+  const value = stockValue(medicines)
+  const visibleMedicines = medicines
+    .filter(m => {
+      if (categoryFilter === NO_BARCODE_FILTER) { if (!lacksBarcode(m)) return false }
+      else if (categoryFilter && (m.category || UNCATEGORIZED) !== categoryFilter) return false
+      return !q || [m.name, m.category, m.barcode].some(v => v?.toLowerCase().includes(q))
+    })
+    .sort((a, b) => a.name.localeCompare(b.name))
+  const filterOptions = [
+    ...CATEGORIES.filter(c => medicines.some(m => m.category === c)),
+    ...(medicines.some(m => !m.category) ? [UNCATEGORIZED] : []),
+    ...(missingBarcodeCount > 0 ? [NO_BARCODE_FILTER] : [])
+  ]
+  const filterLabel = (c) => (c === NO_BARCODE_FILTER ? `No barcode (${missingBarcodeCount})` : c)
+  const isFiltering = q !== "" || categoryFilter !== ""
+
   return (
     <div className="min-h-screen bg-[#F5F5F0] max-w-sm mx-auto">
-      <div className="bg-green-700 px-4 pt-10 pb-4">
-        <h1 className="text-white text-xl font-semibold">PharmaSnap</h1>
-        <p className="text-green-200 text-sm">Sokhim's Pharmacy</p>
+      <div className="bg-green-700 px-4 pt-10 pb-4 flex items-start justify-between gap-3">
+        <div>
+          <h1 className="text-white text-xl font-semibold">PharmaSnap</h1>
+          <p className="text-green-200 text-sm">Nalin's Pharmacy</p>
+        </div>
+        <button
+          onClick={() => navigate("analytics")}
+          className="bg-green-800 text-white text-sm px-3 py-1.5 rounded-full active:bg-green-900"
+        >
+          📊 Analytics
+        </button>
       </div>
+
+      {medicines.length > 0 && (
+        <div className="mx-4 mt-4 bg-white rounded-xl p-4 shadow-sm border border-gray-100">
+          <p className="text-xs text-gray-500 font-medium uppercase tracking-wide">Total stock value</p>
+          <div className="grid grid-cols-2 gap-3 mt-2">
+            <div>
+              <p className="text-xs text-gray-400">At cost</p>
+              <p className="text-base font-semibold text-gray-800">{formatMoney(value.cost)}</p>
+            </div>
+            <div>
+              <p className="text-xs text-gray-400">At selling price</p>
+              <p className="text-base font-semibold text-gray-800">{formatMoney(value.retail)}</p>
+            </div>
+          </div>
+          <p className="text-xs text-green-700 mt-2">Potential profit {formatMoney(value.potentialProfit)}</p>
+          {value.expiredCost > 0 && (
+            <p className="text-xs text-red-600 mt-1">Expired stock: {formatMoney(value.expiredCost)} at cost</p>
+          )}
+          {value.unpricedCount > 0 && (
+            <p className="text-xs text-gray-400 mt-1">
+              {value.unpricedCount} {value.unpricedCount === 1 ? "medicine has" : "medicines have"} no buy or sell price, so the totals are incomplete
+            </p>
+          )}
+        </div>
+      )}
+
+      {missingBarcodeCount > 0 && (
+        <div className="mx-4 mt-4 bg-gray-50 border border-gray-200 rounded-lg p-3 flex items-center justify-between gap-3">
+          <p className="text-gray-700 text-sm">
+            {missingBarcodeCount} {missingBarcodeCount === 1 ? "medicine has" : "medicines have"} no barcode
+          </p>
+          <button onClick={() => setCategoryFilter(NO_BARCODE_FILTER)} className="text-sm text-green-700 font-medium whitespace-nowrap">
+            Show
+          </button>
+        </div>
+      )}
 
       {lowStock.length > 0 && (
         <div className="mx-4 mt-4 bg-amber-50 border border-amber-300 border-l-4 border-l-amber-500 rounded-lg p-3">
           <p className="text-amber-800 font-semibold text-sm">⚠️ Low stock — reorder now</p>
           {lowStock.map(m => (
             <p key={m.id} className="text-amber-700 text-sm mt-1">
-              {m.name} — only {m.qty} left
+              {m.name} — only {formatStock(m.qty, m)} left
             </p>
           ))}
         </div>
@@ -332,7 +511,7 @@ function App() {
           <p className="text-blue-800 font-semibold text-sm">📦 Suggested reorder (based on last 4 weeks)</p>
           {reorderNow.map(f => (
             <p key={f.id} className="text-blue-700 text-sm mt-1">
-              {f.name} — order ~{f.suggestedReorder} (selling {f.weeklyVelocity}/week)
+              {f.name} — order ~{f.suggestedReorder}{f.unitsPerBox > 1 ? (f.suggestedReorder === 1 ? " box" : " boxes") : ""} (selling {f.weeklyVelocity}{f.unitsPerBox > 1 ? ` ${f.unitName || "unit"}s` : ""}/week)
             </p>
           ))}
         </div>
@@ -350,12 +529,61 @@ function App() {
       )}
 
       <div className="px-4 mt-4">
+        <div className="flex gap-2 mb-3">
+          <input
+            type="search"
+            placeholder="Search name, category or barcode"
+            value={query}
+            onChange={e => { setQuery(e.target.value); setSearchNotice(null) }}
+            className="flex-1 min-w-0 bg-white rounded-full px-4 py-2 text-sm text-gray-800 outline-none border border-gray-200 focus:border-green-500"
+          />
+          <button
+            onClick={() => openScanner("search")}
+            aria-label="Scan a barcode to find a medicine"
+            className="bg-white border border-gray-200 rounded-full px-3 text-lg active:bg-green-50"
+          >
+            📷
+          </button>
+        </div>
+
+        {searchNotice && (
+          <div className="bg-amber-50 border border-amber-200 rounded-lg p-3 mb-3">
+            <p className="text-amber-800 text-sm">No medicine has the barcode {searchNotice.code}</p>
+            <div className="flex gap-4 mt-2">
+              <button onClick={() => startAdd("", searchNotice.code)} className="text-sm text-green-700 font-medium">
+                Add it
+              </button>
+              <button onClick={() => setSearchNotice(null)} className="text-sm text-gray-500">
+                Dismiss
+              </button>
+            </div>
+          </div>
+        )}
+
+        {filterOptions.length > 0 && (
+          <div className="flex gap-2 overflow-x-auto pb-2 mb-1">
+            {["", ...filterOptions].map(c => (
+              <button
+                key={c || "all"}
+                onClick={() => setCategoryFilter(c)}
+                className={`whitespace-nowrap text-xs px-3 py-1 rounded-full border ${
+                  categoryFilter === c
+                    ? "bg-green-700 text-white border-green-700"
+                    : "bg-white text-gray-600 border-gray-200"
+                }`}
+              >
+                {c ? filterLabel(c) : "All"}
+              </button>
+            ))}
+          </div>
+        )}
+
         <div className="flex justify-between items-center mb-3">
           <h2 className="text-gray-700 font-semibold">
-            Inventory ({medicines.length})
+            Inventory ({isFiltering ? `${visibleMedicines.length} of ${medicines.length}` : medicines.length})
           </h2>
           <button
-            onClick={() => setScreen("add")}
+            onClick={() => startAdd()}
             className="text-sm bg-green-700 text-white px-3 py-1 rounded-full"
           >
             + Add medicine
@@ -366,9 +594,18 @@ function App() {
           <div className="text-center py-12 text-gray-400 text-sm">Loading inventory...</div>
         ) : medicines.length === 0 ? (
           <div className="text-center py-12 text-gray-400 text-sm">No medicines yet. Tap + Add medicine to get started.</div>
+        ) : visibleMedicines.length === 0 ? (
+          <div className="text-center py-12 text-gray-400 text-sm">
+            <p>Nothing matches{q ? ` "${query.trim()}"` : ""}.</p>
+            {q && (
+              <button onClick={() => startAdd(query.trim())} className="mt-3 text-green-700 font-medium">
+                Add "{query.trim()}" as a new medicine
+              </button>
+            )}
+          </div>
         ) : (
           <div className="flex flex-col gap-2 pb-8">
-            {medicines.map(med => {
+            {visibleMedicines.map(med => {
               const isLow = med.qty <= med.threshold
               const isExpiringSoon = med.expiry && (() => {
                 const days = Math.ceil((new Date(med.expiry) - new Date()) / (1000 * 60 * 60 * 24))
@@ -377,16 +614,23 @@ function App() {
               return (
                 <div
                   key={med.id}
-                  className={`bg-white rounded-xl p-4 flex justify-between items-center shadow-sm border ${
+                  role="button"
+                  tabIndex={0}
+                  onClick={() => navigate("detail", med.id)}
+                  onKeyDown={e => { if (e.key === "Enter") navigate("detail", med.id) }}
+                  className={`bg-white rounded-xl p-4 flex justify-between items-center gap-3 shadow-sm border cursor-pointer ${
                     isLow ? "border-red-200 bg-red-50" : "border-gray-100"
                   }`}
                 >
-                  <div>
+                  <div className="min-w-0">
                     <p className={`font-medium text-sm ${isLow ? "text-red-700" : "text-gray-800"}`}>
                       {med.name}
                     </p>
+                    {med.category && (
+                      <p className="text-xs text-gray-400 mt-0.5">{med.category}</p>
+                    )}
                     <p className={`text-xs mt-1 ${isLow ? "text-red-500 font-semibold" : "text-gray-400"}`}>
-                      {med.qty} in stock
+                      {formatStock(med.qty, med)} in stock
                     </p>
                     {isLow && (
                       <span className="text-xs bg-red-100 text-red-600 px-2 py-0.5 rounded-full mt-1 inline-block">
@@ -398,13 +642,18 @@ function App() {
                         Expires soon
                       </span>
                     )}
+                    {lacksBarcode(med) && (
+                      <span className="text-xs bg-gray-100 text-gray-500 px-2 py-0.5 rounded-full mt-1 ml-1 inline-block">
+                        No barcode
+                      </span>
+                    )}
                   </div>
                   <button
-                    onClick={() => sellOne(med.id)}
+                    onClick={e => { e.stopPropagation(); sellOne(med.id) }}
                     disabled={med.qty === 0}
-                    className="bg-green-600 text-white text-xs px-4 py-2 rounded-full disabled:bg-gray-300 disabled:cursor-not-allowed active:bg-green-800"
+                    className="bg-green-600 text-white text-xs px-4 py-2 rounded-full whitespace-nowrap disabled:bg-gray-300 disabled:cursor-not-allowed active:bg-green-800"
                   >
-                    {med.qty === 0 ? "Out of stock" : "Sold one"}
+                    {med.qty === 0 ? "Out of stock" : sellLabel(med)}
                   </button>
                 </div>
               )
@@ -412,6 +661,10 @@ function App() {
           </div>
         )}
       </div>
+
+      {scannerOpen && (
+        <BarcodeScanner onDetected={handleBarcodeDetected} onClose={() => setScannerOpen(false)} />
+      )}
     </div>
   )
 }
