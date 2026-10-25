@@ -1,8 +1,7 @@
 # PharmaSnap
 
-A lightweight inventory app for small pharmacies: track stock, get
-low-stock and reorder alerts, catch stock that will expire unsold, and
-now — scan a medicine box with your phone camera instead of typing.
+A lightweight inventory app for small pharmacies to track stock, get
+low-stock and reorder alerts, catch stock that will expire unsold, and scan a medicine box with your phone camera.
 
 ## Stack
 
