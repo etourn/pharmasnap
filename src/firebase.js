@@ -4,7 +4,7 @@ import { getAuth } from "firebase/auth"
 
 // For Firebase JS SDK v7.20.0 and later, measurementId is optional
 const firebaseConfig = {
-  apiKey: "AIzaSyDQDikL0W291OoG-Y649AQulKZiSwatA9g",
+  apiKey: "",
   authDomain: "pharmasnap-1c2aa.firebaseapp.com",
   projectId: "pharmasnap-1c2aa",
   storageBucket: "pharmasnap-1c2aa.firebasestorage.app",
